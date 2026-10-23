@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { mountTasks } from './tasks.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,6 +9,7 @@ import helmet from 'helmet';
 import jwt from 'jsonwebtoken';
 import pg from 'pg';
 import { mountOperationalRecordActions, recordPermissions } from './operationalRecordActions.mjs';
+import { buildRecordInsights, deterministicBrief, filterRows, parseListQuery, sendExport } from './featurePack.mjs';
 
 const backendRoot = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.dirname(backendRoot);
@@ -112,6 +114,7 @@ function normalizedResult(content, workflow, analysisType, providerMeta) {
   ];
   const providerNote = structured ? professionalText(plainText(trailing).replace(/^\s*Assumption\s*:\s*/i, '').trim()) : '';
   return {
+    aiGenerated: true,
     provider: 'openrouter', model: providerMeta.model, providerReceipt: providerMeta.receipt, usage: providerMeta.usage,
     presentation: structured ? 'professional-structured' : 'professional-safe-fallback',
     analysisType,
@@ -228,7 +231,7 @@ export function createApp() {
     try { await pool.query('SELECT 1'); res.json({ status: 'ok', app: config.id, title: config.title, tagline: config.tagline, accent: config.accent, database: 'postgresql', ai: aiStatus() }); }
     catch { res.status(503).json({ status: 'error', error: 'PostgreSQL is unavailable' }); }
   });
-  app.get('/api/auth/demo-credentials', (_req, res) => res.json({ email: process.env.DEMO_EMAIL || 'runtime-admin@example.com', password: process.env.DEMO_PASSWORD || 'LocalDemo!2026' }));
+  app.get('/api/auth/demo-credentials',(_req,res)=>res.status(404).json({error:'Credential discovery is disabled'}));
   app.post('/api/auth/login', async (req, res) => {
     const email = String(req.body?.email || '').trim().toLowerCase();
     const result = await pool.query('SELECT id,email,name,role,password_hash FROM app_users WHERE email=$1', [email]);
@@ -239,6 +242,7 @@ export function createApp() {
   });
   app.use('/api', auth);
   mountOperationalRecordActions(app, { pool, config, identifier, audit });
+  mountTasks(app, { pool, audit });
   app.get('/api/app', (req, res) => res.json({ ...config, user: req.user, ai: aiStatus() , recordPermissions: recordPermissions(req.user) }));
   app.get('/api/dashboard', async (_req, res) => {
     const [records, attention, recent, analyses] = await Promise.all([
@@ -297,14 +301,29 @@ export function createApp() {
   app.get('/api/workflows', (_req, res) => res.json({ items: config.workflows }));
   app.get('/api/records', async (req, res) => {
     const result = req.query.workflow ? await pool.query('SELECT * FROM workflow_cases WHERE workflow_id=$1 ORDER BY due_date', [req.query.workflow]) : await pool.query('SELECT * FROM workflow_cases ORDER BY due_date');
-    res.json({ items: result.rows });
+    res.json({ items: filterRows(result.rows, req.query) });
+  });
+  app.get('/api/exports/records', async (req, res) => {
+    const result = req.query.workflow ? await pool.query('SELECT * FROM workflow_cases WHERE workflow_id=$1 ORDER BY due_date', [req.query.workflow]) : await pool.query('SELECT * FROM workflow_cases ORDER BY due_date');
+    return sendExport(res, filterRows(result.rows, req.query), parseListQuery(req.query).format, 'workflow-records');
+  });
+  app.get('/api/ai/insights', async (req, res) => {
+    const result = await pool.query('SELECT * FROM workflow_cases ORDER BY due_date');
+    const rows = filterRows(result.rows, req.query);
+    res.json({ aiGenerated: false, provider: 'deterministic-fallback', label: 'Deterministic fallback — not AI-generated', insights: buildRecordInsights(rows, { subject: 'Pipeline integrity operational records', titles: ['ILI anomaly deadline and risk brief', 'Corrosion and assessment ageing summary', 'PHMSA evidence readiness brief'], disclaimer: 'Operational summary from stored records only; not a safety determination. Validate source evidence with qualified integrity reviewers before field action.' }) });
   });
   app.get('/api/operations', (_req, res) => res.json({ items: config.operations }));
   app.get('/api/operation-records', async (req, res) => {
     const module = config.operations.find(item => item.id === req.query.module);
     if (!module) return res.status(404).json({ error: 'Unknown operational module' });
     const result = await pool.query(`SELECT * FROM ${identifier(module.table)} ORDER BY due_date`);
-    res.json({ module, items: result.rows });
+    res.json({ module, items: filterRows(result.rows, req.query) });
+  });
+  app.get('/api/exports/operation-records', async (req, res) => {
+    const module = config.operations.find(item => item.id === req.query.module);
+    if (!module) return res.status(404).json({ error: 'Unknown operational module' });
+    const result = await pool.query(`SELECT * FROM ${identifier(module.table)} ORDER BY due_date`);
+    return sendExport(res, filterRows(result.rows, req.query), parseListQuery(req.query).format, `${module.id}-records`);
   });
   app.get('/api/reports', async (_req, res) => {
     const modules = [];
@@ -329,6 +348,10 @@ export function createApp() {
       const inputs = req.body?.inputs || {};
       const missing = workflow.fields.filter(field => field.required && !inputs[field.key]).map(field => field.label);
       if (missing.length) return res.status(422).json({ error: 'Complete required fields', missing });
+      if (!aiStatus().configured) {
+        const stored = await pool.query('SELECT * FROM workflow_cases WHERE workflow_id=$1 ORDER BY due_date', [workflow.id]);
+        return res.json(deterministicBrief({ title: workflow.title, inputs, rows: stored.rows, disclaimer: 'Operational summary from stored records only; not a safety determination. Validate source evidence with qualified integrity reviewers before field action.' }));
+      }
       res.json(await callOpenRouter(workflow, inputs, analysisType, aiRequestController.signal));
     } catch (error) { (!res.destroyed && next(error)); }
   });
